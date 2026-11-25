@@ -35,11 +35,6 @@
   .field { display:grid; gap:4px; margin-top:10px; color:var(--muted); font-size:14px; }
 </style>
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-<!-- Safety gate (TensorFlow.js + NSFWJS); model weights from jsDelivr -->
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/nsfwjs@2.4.2/dist/nsfwjs.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/nsfwjs@4.2.1/dist/models/mobilenet_v2/model.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/nsfwjs@4.2.1/dist/models/mobilenet_v2/group1-shard1of1.min.js"></script>
 </head>
 <body>
 <header>
@@ -93,7 +88,6 @@ import { FilesetResolver, HandLandmarker, ImageSegmenter, ObjectDetector, Intera
 const CFG = {
   ALLOWED: ["hot dog"],      // held objects that may stay in the hand (COCO "hot dog" stands in for sausage)
   DETECT_MIN_SCORE: 0.3, DETECT_EVERY: 8, OBJMASK_EVERY: 4, OBJ_MISS_LIMIT: 3,
-  NSFW_EVERY_MS: 600, NSFW_CLASSES: ["Porn", "Hentai"], NSFW_BLOCK: 0.55, NSFW_HOLD_MS: 2000,
 };
 const PREFIX = "metahand-scene-";
 /* Mobile data usually needs a TURN relay. Put your own details here (Metered, Twilio, Cloudflare…). */
@@ -185,17 +179,7 @@ async function loadModels() {
     create(ObjectDetector, vision, MODELS.det, { runningMode: "VIDEO", scoreThreshold: CFG.DETECT_MIN_SCORE, categoryAllowlist: CFG.ALLOWED, maxResults: 3 }),
     create(InteractiveSegmenter, vision, MODELS.magic, { outputCategoryMask: false, outputConfidenceMasks: true }),
   ]);
-  let nsfw = null;
-  try {
-    const mj = window.model, w64 = window.group1_shard1of1;
-    if (!mj || !w64) throw new Error("safety model files missing");
-    const bin = atob(w64), bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    nsfw = await window.nsfwjs.load(tf.io.fromMemory({
-      modelTopology: mj.modelTopology, weightSpecs: mj.weightsManifest[0].weights, weightData: bytes.buffer,
-    }), { size: 224 });
-  } catch (e) { console.error("Safety model failed", e); }
-  return { hand, seg, det, magic, nsfw };
+  return { hand, seg, det, magic };
 }
 
 // ---------- Hand cut-out (same method as the MetaHand Live app) ----------
@@ -335,32 +319,30 @@ function makeCutter(video, M, maxDim) {
 
   function step() {
     let ts = performance.now(); if (ts <= lastTs) ts = lastTs + 1; lastTs = ts; n++;
-    fctx.drawImage(video, 0, 0, w, h);                // one snapshot for tracking, mask and picture
+    fctx.drawImage(video, 0, 0, w, h);
     const r = M.hand.detectForVideo(frame, ts);
     if (r.landmarks && r.landmarks.length) { last = r.landmarks; lastT = ts; }
     const hands = ts - lastT < 250 ? last : [];
-    hctx.clearRect(0, 0, w, h); hctx.fillStyle = "#fff";
-    for (const lm of hands) fillPoly(hctx, polygon(lm));
-    mctx.globalCompositeOperation = "source-over"; mctx.clearRect(0, 0, w, h);
+    mctx.globalCompositeOperation = "source-over";
+    mctx.clearRect(0, 0, w, h);
+
+    // Retain the complete body-skin and face-skin masks instead of clipping
+    // them to hand landmarks. This includes visible hands and other exposed skin.
+    M.seg.segmentForVideo(frame, ts, (res) => {
+      const ms = res.confidenceMasks;
+      if (!ms || ms.length < 4) return;
+      const a = ms[2].getAsFloat32Array(), b = ms[3].getAsFloat32Array();
+      const d = ensureSeg(ms[2].width, ms[2].height);
+      for (let i = 0; i < a.length; i++) {
+        const v = Math.min(1, a[i] + b[i]);
+        d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = 255;
+        d[i * 4 + 3] = v > 0.42 ? 255 : 0;
+      }
+      sctx.putImageData(segImg, 0, 0);
+      mctx.drawImage(seg, 0, 0, w, h);
+    });
     heldObject(hands, ts);
-    if (hands.length) {
-      let any = false;
-      M.seg.segmentForVideo(frame, ts, (res) => {
-        const ms = res.confidenceMasks; if (!ms || ms.length < 4) return;
-        const a = ms[2].getAsFloat32Array(), b = ms[3].getAsFloat32Array(); // body skin + face skin
-        const d = ensureSeg(ms[2].width, ms[2].height);
-        for (let i = 0, k = a.length; i < k; i++) { const v = a[i] + b[i]; d[i * 4 + 3] = v > 1 ? 255 : v * 255; }
-        sctx.putImageData(segImg, 0, 0); mctx.drawImage(seg, 0, 0, w, h); any = true;
-      });
-      if (any) {
-        mctx.globalCompositeOperation = "destination-in"; mctx.drawImage(hull, 0, 0);
-        mctx.globalCompositeOperation = "source-over"; mctx.fillStyle = "#fff";
-        for (const lm of hands) fillPoly(mctx, core(lm));
-        if (objBox && objReady) mctx.drawImage(obj, 0, 0, w, h);
-        if (opt.bridge) for (const lm of hands) bridge(lm);
-        keepConnected(hands);
-      } else mctx.drawImage(hull, 0, 0);
-    }
+    if (objBox && objReady) mctx.drawImage(obj, 0, 0, w, h);
     pctx.drawImage(frame, 0, 0);
     pctx.fillStyle = "#000"; pctx.fillRect(w, 0, w, h);
     pctx.drawImage(mask, w, 0);
@@ -452,10 +434,8 @@ function makeCompositor() {
 // ---------- Hand owner view ----------
 const out = $("out"), ox = out.getContext("2d");
 let comp = null;
-const gateC = canvas(224, 224), gx = gateC.getContext("2d");
 const hVideo = $("hVideo"), remote = $("hRemote");
 let cutter = null, running = false, bgImg = null, peer = null, remoteOk = false;
-const gate = { ok: false, score: null, until: 0, busy: false, last: 0 };
 let fps = 0, fpsN = 0, fpsT = performance.now(), info = { hands: 0, object: 0 };
 
 $("hBg").addEventListener("change", (e) => {
@@ -479,21 +459,6 @@ function drawScene(W, H) {
   }
 }
 
-async function gateCheck(now) {
-  if (!models.nsfw) { gate.ok = false; return; }
-  if (gate.busy || now - gate.last < CFG.NSFW_EVERY_MS) return;
-  gate.busy = true; gate.last = now;
-  gx.drawImage(out, 0, 0, 224, 224);
-  try {
-    const p = await models.nsfw.classify(gateC);
-    const s = p.filter((q) => CFG.NSFW_CLASSES.includes(q.className)).reduce((a, q) => a + q.probability, 0);
-    gate.score = s;
-    if (s >= CFG.NSFW_BLOCK) gate.until = performance.now() + CFG.NSFW_HOLD_MS;
-    gate.ok = performance.now() >= gate.until;
-  } catch (e) { console.error(e); gate.ok = false; }
-  gate.busy = false;
-}
-
 function render() {
   if (!cutter) return;
   info = cutter.step();
@@ -507,23 +472,14 @@ function render() {
     if (!comp) comp = makeCompositor();
     ox.drawImage(comp.render(out, cutter.pack, W, H, mirror), 0, 0, W, H);
   }
-  // Safety gate checks what is on screen; withheld frames are covered
-  gateCheck(performance.now());
-  if (!gate.ok) {
-    drawScene(W, H);
-    ox.fillStyle = "rgba(0,0,0,.55)"; ox.fillRect(0, 0, W, H);
-    ox.fillStyle = "#fff"; ox.textAlign = "center"; ox.font = `${Math.round(H / 30)}px -apple-system, sans-serif`;
-    ox.fillText(models.nsfw ? (gate.score == null ? "Starting safety check…" : "Frame withheld by safety check") : "Safety model not loaded – output off", W / 2, H / 2);
-  }
   fpsN++; const now = performance.now();
   if (now - fpsT > 1000) { fps = fpsN * 1000 / (now - fpsT); fpsN = 0; fpsT = now; }
   const b = $("badge");
-  b.textContent = !gate.ok ? "withheld" : info.object ? `hand + ${CFG.ALLOWED[0]}` : info.hands ? "hand" : "no hand";
-  b.style.color = !gate.ok ? "var(--bad)" : info.object ? "var(--ok)" : "var(--text)";
+  b.textContent = info.object ? `hands + ${CFG.ALLOWED[0]}` : "all visible skin";
+  b.style.color = "var(--ok)";
   $("hStats").textContent =
-    `fps ${fps.toFixed(1)} · hands ${info.hands} · object ${info.object ? info.object.toFixed(2) : "–"} · cut ${cutter.w}×${cutter.h}\n` +
-    `scene ${remoteOk ? remote.videoWidth + "×" + remote.videoHeight + " (live)" : bgImg ? "image" : "default"} · ` +
-    `safety ${gate.score == null ? "pending" : gate.score.toFixed(3)} ${gate.ok ? "pass" : "withheld"}`;
+    `fps ${fps.toFixed(1)} · tracked hands ${info.hands} · object ${info.object ? info.object.toFixed(2) : "–"} · cut ${cutter.w}×${cutter.h}\n` +
+    `scene ${remoteOk ? remote.videoWidth + "×" + remote.videoHeight + " (live)" : bgImg ? "image" : "default"} · mask body-skin + face-skin`;
 }
 let lastVT = -1;
 function loop() {
@@ -571,7 +527,7 @@ async function initHand() {
   try {
     models = await loadModels();
     $("hStart").disabled = false;
-    say(models.nsfw ? "Ready. Tap Start, then enter the code on the scene device." : "Vision ready, but safety model failed to load – output will stay off.", models.nsfw ? "ok" : "bad");
+    say("Ready. Tap Start, then enter the code on the scene device.", "ok");
   } catch (e) { console.error(e); say("Model load failed: " + e.message, "bad"); handInit = false; }
 }
 </script>
